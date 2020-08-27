@@ -2,20 +2,22 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import scipy.io as scio
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 
 torch.manual_seed(7)    # reproducible
 
-experiment_data = scio.loadmat('skin sensor experiment data.mat')
-circle_size = torch.from_numpy(experiment_data['circle_size'].astype(np.float32)) * 1e-6
-# the weight of skin sensor lens and cap is 2.65g, the unit of pressure is N
-pressure = torch.from_numpy((np.squeeze(experiment_data['pressure']).astype(np.float32) + 2.65) * 0.0098)
-fake_pixel_num = torch.from_numpy(np.arange(60000, 85000, 1000).repeat(5).reshape(-1, 5)).type(torch.FloatTensor) * 1e-6
+# narrow down the dimension of FOV_size values to match the dimension of contact_force for convenience of training network
+FOV_size = torch.from_numpy(np.load('skin sensor experimental FOV size values.npy').astype(np.float32)) * 1e-6
+# the weight of skin sensor glass plate is 2.65g, the unit of contact_force is N
+contact_force = torch.from_numpy((np.load('skin sensor experimental contact force values.npy').astype(np.float32) + 2.65) * 0.0098)
+# input man-made ideal FOV size values into network to calculate the force-FOV relationship
+ideal_FOV_size = torch.from_numpy(np.arange(60000, 85000, 1000).repeat(5).reshape(-1, 5)).type(torch.FloatTensor) * 1e-6
+contact_force_for_ideal_FOV_size = None
 
 
-def P_N(N, C1, C2):
+# this is the qualitative physical model between contact force and FOV size
+def F_N(N, C1, C2):
     return C2 - C1 / np.sqrt(N)
 
 
@@ -44,26 +46,26 @@ for iteration in range(7):
     while abs(train_loss_before - train_loss) > tolerance[min(iteration, 1)]:
         epoch += 1
         train_loss_before = train_loss
-        train_prediction = net(circle_size)
-        train_loss = loss_func(train_prediction, pressure)
+        train_prediction = net(FOV_size)
+        train_loss = loss_func(train_prediction, contact_force)
         optimizer.zero_grad()
         train_loss.backward()
         optimizer.step()
 
         plt.cla()
-        plt.plot(circle_size.numpy().ravel('C') * 1e6, pressure.numpy().repeat(5), '.k')
+        plt.plot(FOV_size.numpy().ravel('C') * 1e6, contact_force.numpy().repeat(5), '.k')
         plt.xlabel('pixel number inside FOV')
         plt.ylabel('contact force/N')
         plt.xlim((6e4, 8.5e4))
         plt.grid(True)
-        fake_pressure = net(fake_pixel_num)
-        plt.plot(fake_pixel_num.numpy()[:, 0] * 1e6, fake_pressure.data.numpy(), 'b-')
+        contact_force_for_ideal_FOV_size = net(ideal_FOV_size)
+        plt.plot(ideal_FOV_size.numpy()[:, 0] * 1e6, contact_force_for_ideal_FOV_size.data.numpy(), 'b-')
         plt.text(70000, 0.04, 'Train loss=%.6f' % train_loss.data.numpy(), fontdict={'size': 20, 'color': 'red'})
         plt.pause(0.1)
-
+    # use least square to determine C1 and C2 based on neural network output
     epoch += 1
-    C1_C2 = curve_fit(P_N, fake_pixel_num.numpy().astype(np.float64)[:, 0], fake_pressure.data.numpy().astype(np.float64), bounds=(0, np.inf))[0]
     # convert to float64, or curve_fit doesn't work
+    C1_C2 = curve_fit(F_N, ideal_FOV_size.numpy().astype(np.float64)[:, 0], contact_force_for_ideal_FOV_size.data.numpy().astype(np.float64), bounds=(0, np.inf))[0]
     print(C1_C2, train_loss.data.numpy())
     weight1 = []
     bias1 = []
@@ -71,21 +73,21 @@ for iteration in range(7):
     bias2 = []
     a = []
     for ii in range(0, 32):
-        N1 = fake_pixel_num.numpy()[0, 0] * (12 - ii) / 12 + fake_pixel_num.numpy()[-1, 0] * ii / 12
-        P1 = P_N(N1, C1_C2[0], C1_C2[1])
-        N2 = fake_pixel_num.numpy()[0, 0] * (11 - ii) / 12 + fake_pixel_num.numpy()[-1, 0] * (ii + 1) / 12
-        P2 = P_N(N2, C1_C2[0], C1_C2[1])
-        a.append((P2 - P1) / (N2 - N1))
+        N1 = ideal_FOV_size.numpy()[0, 0] * (12 - ii) / 12 + ideal_FOV_size.numpy()[-1, 0] * ii / 12
+        F1 = F_N(N1, C1_C2[0], C1_C2[1])
+        N2 = ideal_FOV_size.numpy()[0, 0] * (11 - ii) / 12 + ideal_FOV_size.numpy()[-1, 0] * (ii + 1) / 12
+        F2 = F_N(N2, C1_C2[0], C1_C2[1])
+        a.append((F2 - F1) / (N2 - N1))
         if ii == 0:
             weight1.append(list(abs(a[0]) / 5 * np.ones((5,))))
             bias1.append(0)
             weight2[0].append(a[0] / abs(a[0]))
-            bias2.append(P1 - (P2 - P1) / (N2 - N1) * N1)
+            bias2.append(F1 - (F2 - F1) / (N2 - N1) * N1)
         else:
             weight1.append(list(abs(a[ii]-a[ii-1]) / 5 * np.ones((5,))))
             bias1.append(-abs(a[ii]-a[ii-1]) * N1)
             weight2[0].append((a[ii] - a[ii - 1]) / abs(a[ii] - a[ii - 1]))
-
+    # use quantitative physical model to initialize neural network for next iteration
     net.hidden.weight.data = torch.Tensor(weight1)
     net.hidden.bias.data = torch.Tensor(bias1)
     net.predict.weight.data = torch.Tensor(weight2)
